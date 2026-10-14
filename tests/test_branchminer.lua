@@ -244,6 +244,14 @@ test("inventory service during an entered vein returns through its parent",funct
     for i=1,14 do f.items[i]={name="test:ore"..i,count=1} end
     finish(f,m);expect(eq(f.pose,{x=0,y=0,z=0}));expect(m.job.stats.ores==2)
 end)
+test("upper endpoint scans both walls and ceiling after lower vein turns",function()
+    local f=fixture();local m=f.api.Miner.create({length=2,pairs=1,spacing=2,pave=false})
+    f.blocks["-2,1,3"]="minecraft:diamond_ore"
+    f.blocks["-2,2,2"]="minecraft:lapis_ore"
+    finish(f,m)
+    expect(f.output["minecraft:diamond_ore"]==1,"Upper endpoint wall was missed")
+    expect(f.output["minecraft:lapis_ore"]==1,"Upper endpoint ceiling was missed")
+end)
 test("configured chunk-load bounds pause without changing home or job",function()
     local f=fixture();local m=f.api.Miner.create({length=2,pairs=1,spacing=2,veins=false,pave=false,
         bounds={minX=-2,maxX=2,minZ=0,maxZ=1}})

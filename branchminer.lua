@@ -567,6 +567,13 @@ function Miner:tick()
         if (w.phase == "main" or w.phase:match("_out$")) and not self:dig("up") then return false end
         w.stage = "scan"; self:save()
     elseif w.stage == "scan" then
+        -- Vein traversal may change heading. Scan relative to the tunnel, not
+        -- the last incidental ore movement, including the upper endpoint.
+        if self.job.config.veins and not w.phase:match("_lower$") then
+            local headings = { main = 0, left_out = 3, left_raise = 1, left_back = 1,
+                right_out = 1, right_raise = 3, right_back = 3 }
+            if not self:face(headings[w.phase]) then return false end
+        end
         w.stage = "advance"
         if self.job.config.veins and not w.phase:match("_lower$") then
             local h = self.job.pose.h
