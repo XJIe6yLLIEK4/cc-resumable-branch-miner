@@ -1,0 +1,4 @@
+/.branchminer/
+__pycache__/
+*.pyc
+/test-results.json
