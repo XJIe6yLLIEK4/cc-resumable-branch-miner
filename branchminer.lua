@@ -1,8 +1,8 @@
--- Resumable Branch Miner for CC:Tweaked 1.108+ / Minecraft 1.20.1.
+-- Resumable Branch/Quarry Miner for CC:Tweaked 1.108+ / Minecraft 1.20.1.
 -- Copyright (c) 2026 XJIe6yLLIEK4. MIT License.
 -- No external Lua libraries. Each turtle owns its own /.branchminer directory.
 local arguments = { ... }
-local VERSION, SCHEMA = "1.0.0", 1
+local VERSION, SCHEMA = "1.1.0", 1
 local ROOT = "/.branchminer"
 local DIRECTIONS = {
     [0] = { x = 0, z = 1 }, [1] = { x = 1, z = 0 },
@@ -80,7 +80,7 @@ function Miner:save()
     self.job.seq = self.job.seq + 1
     local payload = textutils.serialize(self.job)
     local raw = textutils.serialize({ payload = payload, checksum = checksum(payload) })
-    if #raw > 380000 then error("Checkpoint too large; reduce the ore vein limit.", 0) end
+    if #raw > 380000 then error("Checkpoint too large; reduce the vein limit or quarry radius.", 0) end
     fs.makeDir(ROOT)
     local destination = ROOT .. (self.job.seq % 2 == 0 and "/job.a" or "/job.b")
     writeFile(ROOT .. "/write.tmp", raw)
@@ -99,11 +99,17 @@ function Miner.create(options)
     end
     if fs.exists(ROOT .. "/run.lock") then error("A miner is already running.", 0) end
     local config = {
+        mode = "branch", radius = 5,
         length = 30, pairs = 20, spacing = 3, veins = true, pave = true,
         veinRadius = 6, veinLimit = 128, fuelBuffer = 32, freeSlots = 2,
         discardCommon = false, attack = false, retrySeconds = 3, gps = false,
     }
     for k, v in pairs(options or {}) do config[k] = copy(v) end
+    if config.mode ~= "branch" and config.mode ~= "quarry" then error("Unknown mining mode.", 0) end
+    integer(config.radius, "Quarry radius", 0, 32)
+    -- The quarry removes the whole volume; neither ore excursions nor filling
+    -- its floor are appropriate. All service/recovery code remains shared.
+    if config.mode == "quarry" then config.veins, config.pave = false, false end
     integer(config.length, "Branch length", 1, 512)
     integer(config.pairs, "Branch pairs (0 = continuous)", 0, 1000000)
     integer(config.spacing, "Branch spacing", 2, 64)
@@ -137,6 +143,10 @@ function Miner.create(options)
         work = { pair = 1, phase = "main", step = 1, stage = "move" },
         stats = { moves = 0, blocks = 0, ores = 0, pairs = 0, serviceTrips = 0 },
     }
+    if config.mode == "quarry" then
+        job.work = { phase = "quarry", layer = 0, cell = 0, stage = "entry", blocked = {}, blockedCount = 0 }
+        job.stats.layers = 0
+    end
     local instance = setmetatable({ job = job }, Miner)
     remove(ROOT .. "/control"); instance:save(); return instance
 end
@@ -214,6 +224,7 @@ function Miner:motion(method, target)
         fuel = turtle.getFuelLevel() }
     self:save() -- Write-ahead journal, before the physical action can happen.
     local ok, reason = turtle[method]()
+    self.lastMotion = { method = method, ok = ok, reason = reason }
     if ok then
         self.job.pose = copy(target)
         if method ~= "turnLeft" and method ~= "turnRight" then
@@ -268,6 +279,29 @@ function Miner:resolveProbe()
     local pending = self.job.pending
     local actual = self:gpsPosition()
     if not actual then return self:status("recovery", "GPS unavailable during orientation recovery. Restore GPS and resume.") end
+    if pending.phase == "lift" or pending.phase == "lower" then
+        -- A newly entered quarry column may have rock on all four sides.
+        -- Localize heading on its already cleared approach plane, then return
+        -- down the SAME column. GPS journals the whole vertical excursion.
+        if actual.x ~= pending.base.x or actual.z ~= pending.base.z
+            or actual.y < pending.base.y or actual.y > pending.anchor.y then
+            return self:status("recovery", "Unexpected position during quarry GPS recovery.")
+        end
+        local target = pending.phase == "lift" and pending.anchor or pending.base
+        if not same(actual, target) then
+            local required = distance(actual, target) + (pending.phase == "lift" and distance(pending.anchor, pending.base) + 2 or 0)
+            if not self:refuel(required) then return self:status("recovery", "Add fuel for quarry GPS recovery.") end
+            if not turtle[pending.phase == "lift" and "up" or "down"]() then
+                return self:status("recovery", "Clear the saved quarry recovery column, then resume.")
+            end
+            return false
+        end
+        if pending.phase == "lower" then
+            self.job.pose = point(actual.x, actual.y, actual.z, pending.heading)
+            self.job.pending = nil; self:save(); return true
+        end
+        pending.phase = "out"; self:save()
+    end
     if pending.phase == "out" and not same(actual, pending.anchor) then
         if distance(actual, pending.anchor) ~= 1 or actual.y ~= pending.anchor.y or not pending.attempt then
             return self:status("recovery", "Unexpected position during GPS recovery; manual position verification required.")
@@ -283,7 +317,9 @@ function Miner:resolveProbe()
     if pending.phase == "return" then
         if same(actual, pending.anchor) then
             self.job.pose = point(actual.x, actual.y, actual.z, pending.heading)
-            self.job.pending = nil; self:save(); return true
+            if pending.base then pending.phase = "lower"
+            else self.job.pending = nil end
+            self:save(); return not pending.base
         end
         if not same(actual, pending.out) then return self:status("recovery", "GPS probe return position differs from its journal.") end
         if not self:refuel(1) then return self:status("recovery", "Add fuel to finish the GPS recovery move.") end
@@ -316,6 +352,13 @@ function Miner:resolve()
             return self:status("recovery", "GPS cannot confirm the saved turn position.")
         end
         self.job.pending = { kind = "probe", phase = "out", anchor = copy(actual), original = copy(pending) }
+        if self.job.config.mode == "quarry" and self.job.work.layer > 0 then
+            local clearY = self.job.work.safeY or (1 - self.job.work.layer)
+            if actual.y < clearY then
+                self.job.pending.base, self.job.pending.phase = copy(actual), "lift"
+                self.job.pending.anchor.y = clearY
+            end
+        end
         self:save(); return false
     end
     local actual = self.job.home.world and self:gpsPosition() or nil
@@ -365,6 +408,31 @@ local function add(route, p)
 end
 function Miner:homeRoute()
     local route = {}; add(route, self.job.pose)
+    if self.job.config.mode == "quarry" then
+        local p, w, radius = self.job.pose, self.job.work, self.job.config.radius
+        if same(p, self.job.home) then return route end
+        if w.layer > 0 then
+            -- This whole plane was cleared before beginning the current layer.
+            -- At irregular bedrock keep the LAST fully cleared plane, so later
+            -- trips never try to cross a bedrock pillar.
+            local clearY = w.safeY or (1 - w.layer)
+            add(route, point(p.x, clearY, p.z))
+            add(route, point(0, clearY, 1))
+        else
+            -- The first layer is only partly open. Retrace its cleared snake
+            -- through row endpoints instead of cutting a shortcut through rock.
+            local row = p.z - 1
+            if row > 0 then
+                add(route, point(row % 2 == 0 and -radius or radius, 0, p.z))
+                for previous = row - 1, 1, -1 do
+                    add(route, point(previous % 2 == 0 and radius or -radius, 0, previous + 1))
+                    add(route, point(previous % 2 == 0 and -radius or radius, 0, previous + 1))
+                end
+                add(route, point(radius, 0, 1))
+            end
+        end
+        add(route, point(0, 0, 1)); add(route, self.job.home); return route
+    end
     local vein = self.job.vein
     if vein then
         -- Include the parent when a child move committed before its stack entry.
@@ -550,6 +618,75 @@ function Miner:advance()
     else w.phase = phases[w.phase] end
     w.step, w.stage = 1, "move"; self:save()
 end
+function Miner:quarryTarget()
+    local w, radius = self.job.work, self.job.config.radius
+    local width = radius * 2 + 1
+    -- Reverse the same snake every other layer: descend at its endpoint
+    -- instead of crossing the pit again to reach the next layer's start.
+    local index = w.layer % 2 == 0 and w.cell or (width * width - 1 - w.cell)
+    local row, column = math.floor(index / width), index % width
+    return point(row % 2 == 0 and column - radius or radius - column, -w.layer, row + 1), index + 1
+end
+function Miner:quarryBedrock(column)
+    local w = self.job.work
+    if w.layer == 0 then
+        return self:waiting("Bedrock blocks the starting layer. A new quarry must start above bedrock.")
+    end
+    w.safeY = w.safeY or (1 - w.layer)
+    if not w.blocked[column] then
+        w.blocked[column] = true; w.blockedCount = w.blockedCount + 1
+    end
+    w.stage = "advance"; self:save(); return true
+end
+function Miner:quarry()
+    local w, p = self.job.work, self.job.pose
+    local width = self.job.config.radius * 2 + 1
+    local target, column = self:quarryTarget()
+    if w.stage == "entry" then
+        -- Keep both home chests outside the footprint: X=-r..r, Z=1..2r+1.
+        if self:go(point(0, 0, 1)) then w.stage = "move"; self:save() end
+        return true
+    elseif w.stage == "advance" then
+        if w.blockedCount == width * width then
+            w.phase, w.bottom = "finished", "Bedrock reached in every column."
+        elseif w.cell + 1 < width * width then
+            w.cell, w.stage = w.cell + 1, "move"
+        else
+            self.job.stats.layers = self.job.stats.layers + 1
+            w.layer, w.cell, w.stage = w.layer + 1, 0, "move"
+        end
+        self:save(); return true
+    end
+    if w.blocked[column] then w.stage = "advance"; self:save(); return true end
+    if not self:inside(target) then return self:waiting("Outside configured loaded area. Extend bounds after chunk-loading it.") end
+    if w.stage == "move" and w.safeY then w.stage = "rise"; self:save(); return true end
+    if w.stage == "rise" then
+        if self:go(point(p.x, w.safeY, p.z)) then w.stage = "align"; self:save() end
+        return true
+    elseif w.stage == "align" then
+        if self:go(point(target.x, w.safeY, target.z)) then w.stage = "descend"; self:save() end
+        return true
+    end
+    if same(p, target) then w.stage = "advance"; self:save(); return true end
+    local exists, block
+    if p.y > target.y then exists, block = turtle.inspectDown()
+    else
+        local heading = p.x ~= target.x and (target.x > p.x and 1 or 3) or (target.z > p.z and 0 or 2)
+        if not self:face(heading) then return false end
+        exists, block = turtle.inspect()
+    end
+    if exists and block.name == "minecraft:bedrock" then return self:quarryBedrock(column) end
+    self.lastMotion = nil
+    self:go(target)
+    -- CC:Tweaked's explicit build-height error is distinct from an unloaded
+    -- chunk, entity, border, empty fuel tank or protected player structure.
+    if self.lastMotion and not self.lastMotion.ok and self.lastMotion.method == "down"
+        and self.lastMotion.reason == "Too low to move" then
+        w.phase, w.bottom = "finished", "World height limit reached."
+        self:status("running"); self:save()
+    end
+    return true
+end
 function Miner:tick()
     self:control()
     if self.job.status == "paused" or self.job.status == "cancelled" or self.job.status == "completed" then return false end
@@ -559,6 +696,7 @@ function Miner:tick()
     if self.job.work.phase == "finished" then self:startService(true); return true end
     if not self:resources() then return false end
     if self.job.status == "waiting" then self:status("running") end
+    if self.job.config.mode == "quarry" then return self:quarry() end
     if self.job.vein then return self:vein() end
     local w = self.job.work
     if w.stage == "move" then
@@ -598,7 +736,15 @@ local function summary(job)
     print("Original home: 0,0,0; output chest behind that ORIGINAL start.")
     if job.home.world then print("World home: " .. key(job.home.world)) end
     print("Position: " .. key(job.pose) .. " heading " .. job.pose.h)
-    print("Pair " .. job.work.pair .. " | " .. job.work.phase .. " | step " .. job.work.step .. " | " .. job.work.stage)
+    if job.config.mode == "quarry" then
+        local width = job.config.radius * 2 + 1
+        print("Quarry " .. width .. "x" .. width .. " | depth " .. job.work.layer
+            .. " | cell " .. (job.work.cell + 1) .. "/" .. (width * width) .. " | " .. job.work.stage)
+        print("Bedrock columns: " .. job.work.blockedCount .. "; processed layers: " .. job.stats.layers)
+        if job.work.bottom then print(job.work.bottom) end
+    else
+        print("Pair " .. job.work.pair .. " | " .. job.work.phase .. " | step " .. job.work.step .. " | " .. job.work.stage)
+    end
     if job.service then print("Service: " .. job.service.phase .. "; returning to the saved work position afterwards.") end
     if job.reason then print(job.reason) end
     if job.pending then print("Pending movement: " .. job.pending.kind) end
@@ -633,9 +779,14 @@ local function run(instance)
     else summary(instance.job) end
 end
 local function parse(args)
-    local config = { length = tonumber(args[2]) or 30, pairs = tonumber(args[3]) or 20,
-        spacing = tonumber(args[4]) or 3 }
-    local i = 5
+    local config, i
+    if args[1] == "quarry" then
+        if not tonumber(args[2]) then error("Usage: branchminer quarry <radius> [options]", 0) end
+        config, i = { mode = "quarry", radius = tonumber(args[2]) }, 3
+    else
+        config, i = { mode = "branch", length = tonumber(args[2]) or 30,
+            pairs = tonumber(args[3]) or 20, spacing = tonumber(args[4]) or 3 }, 5
+    end
     while i <= #args do
         local flag = args[i]
         if flag == "--gps" then config.gps = true
@@ -659,7 +810,7 @@ local API = { Miner = Miner, checksum = checksum, decode = decode, parse = parse
 if arguments[1] == "__test__" then return API end
 local function main()
     local command = arguments[1]
-    if command == "new" then run(Miner.create(parse(arguments))); return end
+    if command == "new" or command == "quarry" then run(Miner.create(parse(arguments))); return end
     if command == "boot" then
         -- Only startup.lua calls boot: runtime ownership ends with a computer boot.
         remove(ROOT .. "/run.lock")
@@ -683,6 +834,7 @@ local function main()
     end
     print("Resumable Branch Miner " .. VERSION)
     print("branchminer new <branchLength> <pairs|0> <spacing> [options]")
+    print("branchminer quarry <radius> [options]  (square 2r+1 ahead of the base, down to bedrock)")
     print("branchminer resume | pause | status | cancel")
     print("branchminer recover before|after  (only when action outcome is unknown)")
     print("Options: --gps --heading north|east|south|west --no-veins --no-pave")
