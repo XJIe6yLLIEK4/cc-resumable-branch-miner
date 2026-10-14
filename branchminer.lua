@@ -2,7 +2,7 @@
 -- Copyright (c) 2026 XJIe6yLLIEK4. MIT License.
 -- No external Lua libraries. Each turtle owns its own /.branchminer directory.
 local arguments = { ... }
-local VERSION, SCHEMA = "1.1.0", 1
+local VERSION, SCHEMA = "1.2.0", 1
 local ROOT = "/.branchminer"
 local DIRECTIONS = {
     [0] = { x = 0, z = 1 }, [1] = { x = 1, z = 0 },
@@ -74,6 +74,11 @@ function Miner.load()
     if job.computer ~= os.getComputerID() then
         return nil, "This job belongs to a different turtle. Do not clone job files."
     end
+    if job.config.mode == "quarry" and job.version == "1.1.0" then
+        -- 1.1 forced ore traversal off in EVERY quarry. Enable the new default
+        -- for existing jobs without replacing their cursor, home or route.
+        job.config.veins, job.version = true, VERSION
+    end
     return setmetatable({ job = job }, Miner)
 end
 function Miner:save()
@@ -107,9 +112,8 @@ function Miner.create(options)
     for k, v in pairs(options or {}) do config[k] = copy(v) end
     if config.mode ~= "branch" and config.mode ~= "quarry" then error("Unknown mining mode.", 0) end
     integer(config.radius, "Quarry radius", 0, 32)
-    -- The quarry removes the whole volume; neither ore excursions nor filling
-    -- its floor are appropriate. All service/recovery code remains shared.
-    if config.mode == "quarry" then config.veins, config.pave = false, false end
+    -- Keep the quarry open, but allow connected ores beyond its main footprint.
+    if config.mode == "quarry" then config.pave = false end
     integer(config.length, "Branch length", 1, 512)
     integer(config.pairs, "Branch pairs (0 = continuous)", 0, 1000000)
     integer(config.spacing, "Branch spacing", 2, 64)
@@ -275,24 +279,41 @@ function Miner:gpsPosition()
     return point(dx * right.x + dz * right.z, math.floor(y + 0.5) - home.world.y,
         dx * forward.x + dz * forward.z)
 end
+function Miner:probeAnchor(actual)
+    local anchor, vein = copy(actual), self.job.vein
+    if vein then
+        -- Only follow the already opened vertical part of the DFS parent path.
+        -- An ore cell OUTSIDE the quarry need not have open rock above it.
+        for index = #vein.stack, 1, -1 do
+            local parent = vein.stack[index].pos
+            if parent.x ~= anchor.x or parent.z ~= anchor.z or math.abs(parent.y - anchor.y) > 1 then break end
+            anchor = copy(parent)
+        end
+    end
+    if (not vein or same(anchor, vein.root)) and self.job.config.mode == "quarry" and self.job.work.layer > 0 then
+        local clearY = self.job.work.safeY or (1 - self.job.work.layer)
+        if anchor.y < clearY then anchor.y = clearY end
+    end
+    return anchor
+end
 function Miner:resolveProbe()
     local pending = self.job.pending
     local actual = self:gpsPosition()
     if not actual then return self:status("recovery", "GPS unavailable during orientation recovery. Restore GPS and resume.") end
     if pending.phase == "lift" or pending.phase == "lower" then
-        -- A newly entered quarry column may have rock on all four sides.
-        -- Localize heading on its already cleared approach plane, then return
-        -- down the SAME column. GPS journals the whole vertical excursion.
+        -- Move along a known open column to localize heading, then return.
+        -- Ore traversal can require either an upward OR downward excursion.
         if actual.x ~= pending.base.x or actual.z ~= pending.base.z
-            or actual.y < pending.base.y or actual.y > pending.anchor.y then
-            return self:status("recovery", "Unexpected position during quarry GPS recovery.")
+            or actual.y < math.min(pending.base.y, pending.anchor.y)
+            or actual.y > math.max(pending.base.y, pending.anchor.y) then
+            return self:status("recovery", "Unexpected position during vertical GPS recovery.")
         end
         local target = pending.phase == "lift" and pending.anchor or pending.base
         if not same(actual, target) then
             local required = distance(actual, target) + (pending.phase == "lift" and distance(pending.anchor, pending.base) + 2 or 0)
-            if not self:refuel(required) then return self:status("recovery", "Add fuel for quarry GPS recovery.") end
-            if not turtle[pending.phase == "lift" and "up" or "down"]() then
-                return self:status("recovery", "Clear the saved quarry recovery column, then resume.")
+            if not self:refuel(required) then return self:status("recovery", "Add fuel for vertical GPS recovery.") end
+            if not turtle[target.y > actual.y and "up" or "down"]() then
+                return self:status("recovery", "Clear the saved recovery column, then resume.")
             end
             return false
         end
@@ -352,12 +373,10 @@ function Miner:resolve()
             return self:status("recovery", "GPS cannot confirm the saved turn position.")
         end
         self.job.pending = { kind = "probe", phase = "out", anchor = copy(actual), original = copy(pending) }
-        if self.job.config.mode == "quarry" and self.job.work.layer > 0 then
-            local clearY = self.job.work.safeY or (1 - self.job.work.layer)
-            if actual.y < clearY then
-                self.job.pending.base, self.job.pending.phase = copy(actual), "lift"
-                self.job.pending.anchor.y = clearY
-            end
+        local anchor = self:probeAnchor(actual)
+        if not same(anchor, actual) then
+            self.job.pending.base, self.job.pending.phase = copy(actual), "lift"
+            self.job.pending.anchor = anchor
         end
         self:save(); return false
     end
@@ -408,8 +427,14 @@ local function add(route, p)
 end
 function Miner:homeRoute()
     local route = {}; add(route, self.job.pose)
+    local vein = self.job.vein
+    if vein then
+        -- Retrace ore parents FIRST, also for a child which entered before its
+        -- stack entry was committed. Geometry shortcuts begin at the OLD root.
+        for index = #vein.stack, 1, -1 do add(route, vein.stack[index].pos) end
+    end
     if self.job.config.mode == "quarry" then
-        local p, w, radius = self.job.pose, self.job.work, self.job.config.radius
+        local p, w, radius = route[#route], self.job.work, self.job.config.radius
         if same(p, self.job.home) then return route end
         if w.layer > 0 then
             -- This whole plane was cleared before beginning the current layer.
@@ -432,11 +457,6 @@ function Miner:homeRoute()
             end
         end
         add(route, point(0, 0, 1)); add(route, self.job.home); return route
-    end
-    local vein = self.job.vein
-    if vein then
-        -- Include the parent when a child move committed before its stack entry.
-        for index = #vein.stack, 1, -1 do add(route, vein.stack[index].pos) end
     end
     local base = route[#route]
     add(route, point(base.x, 0, base.z)); add(route, point(0, 0, base.z))
@@ -553,6 +573,11 @@ function Miner:pave()
     end
     turtle.select(selected)
 end
+function Miner:beginVein(directions)
+    self.job.vein = { root = copy(self.job.pose), count = 0,
+        visited = { [key(self.job.pose)] = true },
+        stack = { { pos = copy(self.job.pose), next = 1, directions = directions } } }
+end
 function Miner:vein()
     local vein = self.job.vein
     if vein.travel then
@@ -646,6 +671,10 @@ function Miner:quarry()
         -- Keep both home chests outside the footprint: X=-r..r, Z=1..2r+1.
         if self:go(point(0, 0, 1)) then w.stage = "move"; self:save() end
         return true
+    elseif w.stage == "scan" then
+        w.stage = "advance"
+        if self.job.config.veins then self:beginVein({ 0, 1, 2, 3, "up", "down" }) end
+        self:save(); return true
     elseif w.stage == "advance" then
         if w.blockedCount == width * width then
             w.phase, w.bottom = "finished", "Bedrock reached in every column."
@@ -667,7 +696,7 @@ function Miner:quarry()
         if self:go(point(target.x, w.safeY, target.z)) then w.stage = "descend"; self:save() end
         return true
     end
-    if same(p, target) then w.stage = "advance"; self:save(); return true end
+    if same(p, target) then w.stage = "scan"; self:save(); return true end
     local exists, block
     if p.y > target.y then exists, block = turtle.inspectDown()
     else
@@ -696,8 +725,8 @@ function Miner:tick()
     if self.job.work.phase == "finished" then self:startService(true); return true end
     if not self:resources() then return false end
     if self.job.status == "waiting" then self:status("running") end
-    if self.job.config.mode == "quarry" then return self:quarry() end
     if self.job.vein then return self:vein() end
+    if self.job.config.mode == "quarry" then return self:quarry() end
     local w = self.job.work
     if w.stage == "move" then
         if self:go(self:workTarget()) then w.stage = "head"; self:save() end
@@ -715,10 +744,11 @@ function Miner:tick()
         w.stage = "advance"
         if self.job.config.veins and not w.phase:match("_lower$") then
             local h = self.job.pose.h
-            self.job.vein = { root = copy(self.job.pose), count = 0,
-                visited = { [key(self.job.pose)] = true },
-                stack = { { pos = copy(self.job.pose), next = 1,
-                    directions = { (h + 3) % 4, (h + 1) % 4, self.job.pose.y == 1 and "up" or "down" } } } }
+            -- Include both endcaps as well as walls/floor/ceiling. Ore past
+            -- branchLength belongs to its vein, not to a new longer branch.
+            local vertical = self.job.pose.y == 1 and "up" or "down"
+            self:beginVein({ (h + 3) % 4, (h + 1) % 4, vertical, h, (h + 2) % 4,
+                vertical == "up" and "down" or "up" })
         end
         self:save()
     else

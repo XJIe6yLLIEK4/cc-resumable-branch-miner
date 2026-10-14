@@ -417,19 +417,19 @@ local function assertQuarry(f,m,radius)
     for _,block in pairs(f.blocks) do expect(block~="minecraft:stone","Stone remains above bedrock") end
 end
 test("square quarry clears every layer and preserves both original home chests",function()
-    local f=quarryFixture(1,-3);local m=f.api.Miner.create(f.api.parse({"quarry","1"}))
+    local f=quarryFixture(1,-3);local m=f.api.Miner.create(f.api.parse({"quarry","1","--no-veins"}))
     expect(m.job.config.veins==false and m.job.config.pave==false)
     finish(f,m);assertQuarry(f,m,1);expect(m.job.stats.layers==3)
     expect(m.job.work.blockedCount==9)
 end)
 test("irregular bedrock is bypassed; all remaining columns reach their own bottom",function()
-    local f=quarryFixture(2,-4,true);local m=f.api.Miner.create({mode="quarry",radius=2})
+    local f=quarryFixture(2,-4,true);local m=f.api.Miner.create({mode="quarry",veins=false,radius=2})
     finish(f,m);assertQuarry(f,m,2);expect(m.job.work.blockedCount==25)
     expect(m.job.work.safeY==-1,"Approach plane was not retained above the highest bedrock")
 end)
 test("quarry returns through the cleared prefix of an unfinished first layer",function()
     for _,position in ipairs({{x=0,y=0,z=1},{x=-1,y=0,z=2},{x=0,y=0,z=3},{x=-2,y=0,z=4}}) do
-        local f=quarryFixture(2,-2);local m=f.api.Miner.create({mode="quarry",radius=2})
+        local f=quarryFixture(2,-2);local m=f.api.Miner.create({mode="quarry",veins=false,radius=2})
         for _=1,1000 do m:tick();if eq(f.pose,position) then break end end
         expect(eq(f.pose,position),"Could not reach first-layer service point")
         local cursor=serial(m.job.work)
@@ -447,7 +447,7 @@ end)
 test("quarry restart during each service phase preserves deep work and original home",function()
     for _,stage in ipairs({"home","unload","fuel","work"}) do
         local f=quarryFixture(1,-5,true)
-        local m=f.api.Miner.create({mode="quarry",radius=1,gps=true,heading="north"})
+        local m=f.api.Miner.create({mode="quarry",veins=false,radius=1,gps=true,heading="north"})
         for _=1,2000 do m:tick();if m.job.work.safeY and f.pose.y<m.job.work.safeY then break end end
         expect(m.job.work.safeY~=nil and f.pose.y<m.job.work.safeY)
         for i=1,14 do expect(f.addItem("test:quarryCargo"..i,1)) end
@@ -466,11 +466,11 @@ test("quarry GPS resumes every physical action before and after interruption",fu
     local injected=0
     for _,shape in ipairs({"flat","uneven"}) do
         local baseline=quarryFixture(1,-3,shape=="uneven")
-        local bm=baseline.api.Miner.create({mode="quarry",radius=1,gps=true,heading="north"})
+        local bm=baseline.api.Miner.create({mode="quarry",veins=false,radius=1,gps=true,heading="north"})
         finish(baseline,bm);local total=baseline.actionCount
         for _,when in ipairs({"before","after"}) do for cutoff=1,total do
             local f=quarryFixture(1,-3,shape=="uneven")
-            local m=f.api.Miner.create({mode="quarry",radius=1,gps=true,heading="north"})
+            local m=f.api.Miner.create({mode="quarry",veins=false,radius=1,gps=true,heading="north"})
             if when=="before" then f.cutBefore=cutoff else f.cutAfter=cutoff end
             expect(not pcall(function()finish(f,m)end),"Quarry power cut did not occur")
             f.cutBefore=nil;f.cutAfter=nil;m=assert(f.api.Miner.load())
@@ -481,7 +481,7 @@ test("quarry GPS resumes every physical action before and after interruption",fu
 end)
 test("quarry GPS lift/probe/lower recovery survives another interruption",function()
     for _,phase in ipairs({"lift","out","return","lower"}) do for _,when in ipairs({"before","after"}) do
-        local f=quarryFixture(1,-4);local m=f.api.Miner.create({mode="quarry",radius=1,gps=true,heading="north"})
+        local f=quarryFixture(1,-4);local m=f.api.Miner.create({mode="quarry",veins=false,radius=1,gps=true,heading="north"})
         for _=1,1000 do m:tick();if f.pose.y==-2 and m.job.work.cell==0 then break end end
         expect(f.pose.y==-2 and m.job.work.cell==0,"Could not enter isolated deep column")
         f.cutAfter=f.actionCount+1
@@ -499,19 +499,19 @@ test("quarry GPS lift/probe/lower recovery survives another interruption",functi
     end end
 end)
 test("quarry pause, resume, replacement protection and chunk bounds share branch behavior",function()
-    local f=quarryFixture(1,-2);local m=f.api.Miner.create({mode="quarry",radius=1,
+    local f=quarryFixture(1,-2);local m=f.api.Miner.create({mode="quarry",veins=false,radius=1,
         bounds={minX=-1,maxX=1,minZ=0,maxZ=2}})
     for _=1,200 do m:tick() end;expect(m.job.status=="waiting" and f.pose.z==2)
     local cursor=serial(m.job.work);f.api.sendControl(m.job,"pause");m:tick()
     expect(m.job.status=="paused" and serial(m.job.work)==cursor)
-    expect(not pcall(f.api.Miner.create,{mode="quarry",radius=2}))
+    expect(not pcall(f.api.Miner.create,{mode="quarry",veins=false,radius=2}))
     m=assert(f.api.Miner.load());m.job.config.bounds.maxZ=3;m:save()
     f.api.sendControl(m.job,"resume");finish(f,m);assertQuarry(f,m,1)
 end)
 test("quarry protected structures wait rather than being mistaken for its bottom",function()
     for _,block in ipairs({"minecraft:chest","computercraft:turtle_advanced","minecraft:reinforced_deepslate"}) do
         local f=quarryFixture(0,-3);f.blocks["0,-1,1"]=block
-        local m=f.api.Miner.create({mode="quarry",radius=0})
+        local m=f.api.Miner.create({mode="quarry",veins=false,radius=0})
         for _=1,50 do m:tick() end
         expect(m.job.status=="waiting" and m.job.work.blockedCount==0)
         expect(f.blocks["0,-1,1"]==block)
@@ -519,13 +519,13 @@ test("quarry protected structures wait rather than being mistaken for its bottom
     end
 end)
 test("quarry reaches the actual build-height limit in a world without bedrock",function()
-    local f=fixture({minY=-2});local m=f.api.Miner.create({mode="quarry",radius=1})
+    local f=fixture({minY=-2});local m=f.api.Miner.create({mode="quarry",veins=false,radius=1})
     finish(f,m);expect(eq(f.pose,{x=0,y=0,z=0}));expect(m.job.work.bottom=="World height limit reached.")
     expect(m.job.stats.layers==3);expect(m.job.work.layer==3)
 end)
 test("quarry fuel waits at the original base and continues after replenishment",function()
     local f=quarryFixture(1,-2);f.fuel=0
-    local m=f.api.Miner.create({mode="quarry",radius=1})
+    local m=f.api.Miner.create({mode="quarry",veins=false,radius=1})
     for _=1,20 do m:tick() end
     expect(m.job.status=="waiting" and eq(f.pose,{x=0,y=0,z=0}))
     f.fuelChest=64;finish(f,m);assertQuarry(f,m,1)
@@ -541,10 +541,146 @@ end)
 test("quarry argument and radius validation happen before creating or moving a job",function()
     local f=fixture()
     for _,args in ipairs({{"quarry"},{"quarry","nope"}}) do expect(not pcall(f.api.parse,args)) end
-    for _,radius in ipairs({-1,1.5,33}) do expect(not pcall(f.api.Miner.create,{mode="quarry",radius=radius})) end
+    for _,radius in ipairs({-1,1.5,33}) do expect(not pcall(f.api.Miner.create,{mode="quarry",veins=false,radius=radius})) end
     local config=f.api.parse({"quarry","5","--gps","--heading","north","--bounds","-5,5,0,11"})
     expect(config.mode=="quarry" and config.radius==5 and config.gps and config.heading=="north")
     expect(config.bounds.maxZ==11);expect(f.actionCount==0);expect(not f.api.Miner.load())
+end)
+test("branch length 20 mines connected ores past block 21 at lower and upper endcaps",function()
+    local f=fixture();local m=f.api.Miner.create({length=20,pairs=1,spacing=2,pave=false})
+    f.blocks["-21,1,2"]="minecraft:diamond_ore";f.blocks["-22,1,2"]="minecraft:diamond_ore"
+    f.blocks["21,0,2"]="minecraft:iron_ore";f.blocks["22,0,2"]="minecraft:iron_ore"
+    f.blocks["22,-1,2"]="minecraft:iron_ore";f.blocks["0,0,3"]="minecraft:lapis_ore"
+    f.blocks["-21,0,2"]="minecraft:obsidian";f.blocks["23,0,2"]="minecraft:obsidian"
+    finish(f,m,30000)
+    expect(f.output["minecraft:diamond_ore"]==2,"Upper endcap ore was missed")
+    expect(f.output["minecraft:iron_ore"]==3,"Lower endcap vein was missed")
+    expect(f.output["minecraft:lapis_ore"]==1,"Main tunnel endcap was missed")
+    expect(f.blocks["-21,0,2"]=="minecraft:obsidian" and f.blocks["23,0,2"]=="minecraft:obsidian")
+    expect(m.job.config.length==20 and m.job.stats.pairs==1 and eq(f.pose,{x=0,y=0,z=0}))
+end)
+test("quarry mines boundary veins on all sides, above it and below uneven bedrock",function()
+    local f=quarryFixture(1,-4)
+    for _,p in ipairs({"3,-1,2","3,-2,2"}) do f.blocks[p]="minecraft:diamond_ore" end
+    for _,p in ipairs({"-2,-2,1","-3,-2,1"}) do f.blocks[p]="minecraft:iron_ore" end
+    for _,p in ipairs({"1,-1,0","1,-2,0"}) do f.blocks[p]="minecraft:lapis_ore" end
+    for _,p in ipairs({"0,-1,4","0,-1,5"}) do f.blocks[p]="minecraft:gold_ore" end
+    for _,p in ipairs({"0,1,2","0,2,2"}) do f.blocks[p]="minecraft:ancient_debris" end
+    for _,p in ipairs({"0,-4,2","0,-5,2"}) do f.blocks[p]="minecraft:copper_ore" end
+    f.blocks["0,-6,2"]="minecraft:bedrock"
+    for _,p in ipairs({"3,0,2","2,0,2","4,-1,2"}) do f.blocks[p]="minecraft:obsidian" end
+    local m=f.api.Miner.create(f.api.parse({"quarry","1"}));expect(m.job.config.veins)
+    finish(f,m,30000)
+    expect(f.output["minecraft:diamond_ore"]==3 and f.output["minecraft:iron_ore"]==2)
+    expect(f.output["minecraft:lapis_ore"]==2 and f.output["minecraft:gold_ore"]==2)
+    expect(f.output["minecraft:ancient_debris"]==2 and f.output["minecraft:copper_ore"]==2)
+    expect(f.output["minecraft:stone"]==f.quarryExpected)
+    for _,p in ipairs({"3,0,2","2,0,2","4,-1,2"}) do expect(f.blocks[p]=="minecraft:obsidian","Ordinary boundary rock was excavated") end
+    expect(f.blocks["0,-1,0"]=="minecraft:chest" and f.blocks["0,0,-1"]=="minecraft:chest")
+    expect(eq(f.pose,{x=0,y=0,z=0}) and m.job.work.blockedCount==9)
+end)
+test("outside quarry vein unload/restart retraces ore parents and keeps the original cursor",function()
+    for _,stage in ipairs({"home","unload","fuel","work"}) do
+        local f=quarryFixture(1,-3);f.blocks["3,-1,2"]="minecraft:diamond_ore"
+        f.blocks["3,0,2"]="minecraft:obsidian";f.blocks["2,0,2"]="minecraft:obsidian"
+        local m=f.api.Miner.create({mode="quarry",radius=1,gps=true,heading="north"})
+        for _=1,3000 do
+            m:tick()
+            if m.job.vein and m.job.vein.travel and not m.job.vein.travel.returning
+                and eq(f.pose,m.job.vein.travel.pos) and f.pose.x==3 then break end
+        end
+        expect(m.job.vein and m.job.vein.travel and f.pose.x==3,"Uncommitted boundary ore child not reached")
+        local cursor,vein,home=serial(m.job.work),serial(m.job.vein),serial(m.job.home)
+        for i=1,14 do expect(f.addItem("test:boundaryLoot"..i,1)) end
+        f.fuel=10;f.chestFull=stage=="unload";f.fuelChest=stage=="fuel" and 0 or 64
+        for _=1,500 do m:tick();if m.job.service and m.job.service.phase==stage then break end end
+        expect(m.job.service and m.job.service.phase==stage,"Boundary service stage not reached: "..stage)
+        expect(serial(m.job.work)==cursor and serial(m.job.vein)==vein)
+        m=assert(f.api.Miner.load());expect(serial(m.job.home)==home)
+        f.chestFull=false;f.fuelChest=64;finish(f,m,30000)
+        expect(f.output["minecraft:diamond_ore"]==2 and f.output["test:boundaryLoot14"]==1)
+        expect(f.blocks["3,0,2"]=="minecraft:obsidian" and f.blocks["2,0,2"]=="minecraft:obsidian")
+        expect(f.output["minecraft:stone"]==f.quarryExpected and eq(f.pose,{x=0,y=0,z=0}))
+    end
+end)
+test("ore beyond mining dimensions still respects explicit chunk bounds and no-veins",function()
+    local f=quarryFixture(1,-2);local m=f.api.Miner.create({mode="quarry",radius=1,
+        bounds={minX=-1,maxX=1,minZ=0,maxZ=3}})
+    finish(f,m);expect(f.blocks["2,-1,2"]=="minecraft:diamond_ore")
+    f=quarryFixture(1,-2);m=f.api.Miner.create(f.api.parse({"quarry","1","--no-veins"}))
+    finish(f,m);assertQuarry(f,m,1)
+end)
+test("1.1 quarry migration enables boundary ores without replacing its saved home or cursor",function()
+    local f=quarryFixture(1,-2);local m=f.api.Miner.create({mode="quarry",radius=1,veins=false})
+    for _=1,12 do m:tick() end
+    m.job.version="1.1.0";m:save();local cursor,home=serial(m.job.work),serial(m.job.home)
+    m=assert(f.api.Miner.load());expect(m.job.config.veins and m.job.version==f.api.version)
+    expect(serial(m.job.work)==cursor and serial(m.job.home)==home)
+    finish(f,m);expect(f.output["minecraft:diamond_ore"]==1 and eq(f.pose,{x=0,y=0,z=0}))
+end)
+local function boxedBoundaryVein(mode)
+    local f,m
+    if mode=="quarry" then
+        f=quarryFixture(1,-3)
+        f.blocks["2,-2,2"]="minecraft:diamond_ore";f.blocks["2,-3,2"]="minecraft:diamond_ore"
+        for _,p in ipairs({"2,0,2","3,-2,2","2,-2,1","2,-2,3","2,-4,2"}) do f.blocks[p]="minecraft:obsidian" end
+        m=f.api.Miner.create({mode="quarry",radius=1,gps=true,heading="north"})
+    else
+        f=fixture()
+        f.blocks["-1,2,2"]="minecraft:diamond_ore";f.blocks["-1,3,2"]="minecraft:diamond_ore"
+        for y=2,3 do for _,p in ipairs({{x=0,z=2},{x=-2,z=2},{x=-1,z=1},{x=-1,z=3}}) do
+            f.blocks[p.x..","..y..","..p.z]="minecraft:obsidian"
+        end end
+        m=f.api.Miner.create({length=1,pairs=1,spacing=2,pave=false,gps=true,heading="north"})
+    end
+    for _=1,4000 do
+        m:tick()
+        if m.job.vein and #m.job.vein.stack>=3 and m.job.vein.travel==nil then break end
+    end
+    expect(m.job.vein and #m.job.vein.stack>=3,"Isolated boundary ore cell not reached: "..mode)
+    expect(f.pose.y==(mode=="quarry" and -2 or 3))
+    return f,m
+end
+local function assertBoundaryVein(f,m,mode)
+    expect(f.output["minecraft:diamond_ore"]==(mode=="quarry" and 3 or 2))
+    expect(eq(f.pose,{x=0,y=0,z=0}) and f.pose.h==0)
+    for _,dug in ipairs(f.dug) do expect(dug.name~="minecraft:obsidian","Recovery cut through ordinary boundary rock") end
+    if mode=="quarry" then expect(f.output["minecraft:stone"]==f.quarryExpected) end
+end
+test("GPS resumes every remaining vein action in boxed ore outside both mining geometries",function()
+    local injected=0
+    for _,mode in ipairs({"quarry","branch"}) do
+        local baseline,bm=boxedBoundaryVein(mode);local first=baseline.actionCount+1
+        for _=1,1000 do bm:tick();if not bm.job.vein then break end end
+        expect(not bm.job.vein,"Boundary vein did not return to root")
+        local last=baseline.actionCount
+        for _,when in ipairs({"before","after"}) do for cutoff=first,last do
+            local f,m=boxedBoundaryVein(mode)
+            if when=="before" then f.cutBefore=cutoff else f.cutAfter=cutoff end
+            expect(not pcall(function()finish(f,m,30000)end),"Boundary power cut did not happen")
+            f.cutBefore=nil;f.cutAfter=nil;m=assert(f.api.Miner.load())
+            finish(f,m,30000);assertBoundaryVein(f,m,mode);injected=injected+1
+        end end
+    end
+    print("  "..injected.." injected boundary-vein interruptions")
+end)
+test("ore GPS vertical escape and return survive another cut above and below the root",function()
+    for _,mode in ipairs({"quarry","branch"}) do for _,phase in ipairs({"lift","out","return","lower"}) do
+        for _,when in ipairs({"before","after"}) do
+            local f,m=boxedBoundaryVein(mode);local base=clone(f.pose)
+            f.cutAfter=f.actionCount+1
+            expect(not pcall(function()m:face((f.pose.h+1)%4)end));f.cutAfter=nil
+            m=assert(f.api.Miner.load());m:resolve()
+            expect(m.job.pending.phase=="lift")
+            expect(mode=="quarry" and m.job.pending.anchor.y>base.y or mode=="branch" and m.job.pending.anchor.y<base.y)
+            for _=1,30 do if m.job.pending and m.job.pending.phase==phase then break end;m:resolve() end
+            expect(m.job.pending and m.job.pending.phase==phase,"Ore probe phase not reached")
+            if when=="before" then f.cutBefore=f.actionCount+1 else f.cutAfter=f.actionCount+1 end
+            expect(not pcall(function()for _=1,30 do m:resolve() end end))
+            f.cutBefore=nil;f.cutAfter=nil;m=assert(f.api.Miner.load())
+            finish(f,m,30000);assertBoundaryVein(f,m,mode)
+        end
+    end end
 end)
 local function install(f,...)
     f.env.http={get=function(url)
@@ -557,7 +693,7 @@ local function install(f,...)
     return assert(load(INSTALLER_SOURCE,"install","t",f.env))(...)
 end
 test("updating the program preserves the saved quarry, startup and previous version",function()
-    local f=quarryFixture(1,-2);local m=f.api.Miner.create({mode="quarry",radius=1})
+    local f=quarryFixture(1,-2);local m=f.api.Miner.create({mode="quarry",veins=false,radius=1})
     for _=1,20 do m:tick() end
     local savedA,savedB=f.files["/.branchminer/job.a"],f.files["/.branchminer/job.b"]
     f.files["/branchminer.lua"]="old version";f.files["/startup.lua"]="custom startup"
