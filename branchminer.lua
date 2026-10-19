@@ -2,7 +2,7 @@
 -- Copyright (c) 2026 XJIe6yLLIEK4. MIT License.
 -- No external Lua libraries. Each turtle owns its own /.branchminer directory.
 local arguments = { ... }
-local VERSION, SCHEMA = "1.2.0", 1
+local VERSION, SCHEMA = "1.3.0", 1
 local ROOT = "/.branchminer"
 local DIRECTIONS = {
     [0] = { x = 0, z = 1 }, [1] = { x = 1, z = 0 },
@@ -29,6 +29,10 @@ end
 local function point(x, y, z, h) return { x = x, y = y, z = z, h = h } end
 local function same(a, b) return a.x == b.x and a.y == b.y and a.z == b.z end
 local function key(p) return p.x .. "," .. p.y .. "," .. p.z end
+local function quarryEdges(config)
+    local left = -math.floor((config.side - 1) / 2)
+    return left, left + config.side - 1
+end
 local function distance(a, b)
     return math.abs(a.x - b.x) + math.abs(a.y - b.y) + math.abs(a.z - b.z)
 end
@@ -79,13 +83,22 @@ function Miner.load()
         -- for existing jobs without replacing their cursor, home or route.
         job.config.veins, job.version = true, VERSION
     end
+    if job.config.mode == "quarry" and job.config.side == nil then
+        local radius = job.config.radius
+        if type(radius) ~= "number" or radius ~= math.floor(radius) or radius < 0 or radius > 32 then
+            return nil, "Invalid legacy quarry radius; keep its saved job files for recovery."
+        end
+        -- Preserve its exact footprint, snake cursor and bedrock column IDs.
+        job.config.side, job.config.radius = radius * 2 + 1, nil
+        job.version = VERSION
+    end
     return setmetatable({ job = job }, Miner)
 end
 function Miner:save()
     self.job.seq = self.job.seq + 1
     local payload = textutils.serialize(self.job)
     local raw = textutils.serialize({ payload = payload, checksum = checksum(payload) })
-    if #raw > 380000 then error("Checkpoint too large; reduce the vein limit or quarry radius.", 0) end
+    if #raw > 380000 then error("Checkpoint too large; reduce the vein limit or quarry side length.", 0) end
     fs.makeDir(ROOT)
     local destination = ROOT .. (self.job.seq % 2 == 0 and "/job.a" or "/job.b")
     writeFile(ROOT .. "/write.tmp", raw)
@@ -104,14 +117,15 @@ function Miner.create(options)
     end
     if fs.exists(ROOT .. "/run.lock") then error("A miner is already running.", 0) end
     local config = {
-        mode = "branch", radius = 5,
+        mode = "branch", side = 10,
         length = 30, pairs = 20, spacing = 3, veins = true, pave = true,
         veinRadius = 6, veinLimit = 128, fuelBuffer = 32, freeSlots = 2,
         discardCommon = false, attack = false, retrySeconds = 3, gps = false,
     }
     for k, v in pairs(options or {}) do config[k] = copy(v) end
     if config.mode ~= "branch" and config.mode ~= "quarry" then error("Unknown mining mode.", 0) end
-    integer(config.radius, "Quarry radius", 0, 32)
+    integer(config.side, "Quarry side length", 1, 65)
+    if config.mode == "quarry" and config.radius ~= nil then error("New quarries need side length, not radius.", 0) end
     -- Keep the quarry open, but allow connected ores beyond its main footprint.
     if config.mode == "quarry" then config.pave = false end
     integer(config.length, "Branch length", 1, 512)
@@ -434,7 +448,8 @@ function Miner:homeRoute()
         for index = #vein.stack, 1, -1 do add(route, vein.stack[index].pos) end
     end
     if self.job.config.mode == "quarry" then
-        local p, w, radius = route[#route], self.job.work, self.job.config.radius
+        local p, w = route[#route], self.job.work
+        local left, right = quarryEdges(self.job.config)
         if same(p, self.job.home) then return route end
         if w.layer > 0 then
             -- This whole plane was cleared before beginning the current layer.
@@ -448,12 +463,12 @@ function Miner:homeRoute()
             -- through row endpoints instead of cutting a shortcut through rock.
             local row = p.z - 1
             if row > 0 then
-                add(route, point(row % 2 == 0 and -radius or radius, 0, p.z))
+                add(route, point(row % 2 == 0 and left or right, 0, p.z))
                 for previous = row - 1, 1, -1 do
-                    add(route, point(previous % 2 == 0 and radius or -radius, 0, previous + 1))
-                    add(route, point(previous % 2 == 0 and -radius or radius, 0, previous + 1))
+                    add(route, point(previous % 2 == 0 and right or left, 0, previous + 1))
+                    add(route, point(previous % 2 == 0 and left or right, 0, previous + 1))
                 end
-                add(route, point(radius, 0, 1))
+                add(route, point(right, 0, 1))
             end
         end
         add(route, point(0, 0, 1)); add(route, self.job.home); return route
@@ -644,13 +659,13 @@ function Miner:advance()
     w.step, w.stage = 1, "move"; self:save()
 end
 function Miner:quarryTarget()
-    local w, radius = self.job.work, self.job.config.radius
-    local width = radius * 2 + 1
+    local w, width = self.job.work, self.job.config.side
+    local left, right = quarryEdges(self.job.config)
     -- Reverse the same snake every other layer: descend at its endpoint
     -- instead of crossing the pit again to reach the next layer's start.
     local index = w.layer % 2 == 0 and w.cell or (width * width - 1 - w.cell)
     local row, column = math.floor(index / width), index % width
-    return point(row % 2 == 0 and column - radius or radius - column, -w.layer, row + 1), index + 1
+    return point(row % 2 == 0 and left + column or right - column, -w.layer, row + 1), index + 1
 end
 function Miner:quarryBedrock(column)
     local w = self.job.work
@@ -665,10 +680,10 @@ function Miner:quarryBedrock(column)
 end
 function Miner:quarry()
     local w, p = self.job.work, self.job.pose
-    local width = self.job.config.radius * 2 + 1
+    local width = self.job.config.side
     local target, column = self:quarryTarget()
     if w.stage == "entry" then
-        -- Keep both home chests outside the footprint: X=-r..r, Z=1..2r+1.
+        -- Both home chests stay outside the square, which starts at Z=1.
         if self:go(point(0, 0, 1)) then w.stage = "move"; self:save() end
         return true
     elseif w.stage == "scan" then
@@ -767,7 +782,7 @@ local function summary(job)
     if job.home.world then print("World home: " .. key(job.home.world)) end
     print("Position: " .. key(job.pose) .. " heading " .. job.pose.h)
     if job.config.mode == "quarry" then
-        local width = job.config.radius * 2 + 1
+        local width = job.config.side
         print("Quarry " .. width .. "x" .. width .. " | depth " .. job.work.layer
             .. " | cell " .. (job.work.cell + 1) .. "/" .. (width * width) .. " | " .. job.work.stage)
         print("Bedrock columns: " .. job.work.blockedCount .. "; processed layers: " .. job.stats.layers)
@@ -811,8 +826,8 @@ end
 local function parse(args)
     local config, i
     if args[1] == "quarry" then
-        if not tonumber(args[2]) then error("Usage: branchminer quarry <radius> [options]", 0) end
-        config, i = { mode = "quarry", radius = tonumber(args[2]) }, 3
+        if not tonumber(args[2]) then error("Usage: branchminer quarry <sideLength> [options]", 0) end
+        config, i = { mode = "quarry", side = tonumber(args[2]) }, 3
     else
         config, i = { mode = "branch", length = tonumber(args[2]) or 30,
             pairs = tonumber(args[3]) or 20, spacing = tonumber(args[4]) or 3 }, 5
@@ -864,7 +879,7 @@ local function main()
     end
     print("Resumable Branch Miner " .. VERSION)
     print("branchminer new <branchLength> <pairs|0> <spacing> [options]")
-    print("branchminer quarry <radius> [options]  (square 2r+1 ahead of the base, down to bedrock)")
+    print("branchminer quarry <sideLength> [options]  (10 = 10x10 ahead of the base, down to bedrock)")
     print("branchminer resume | pause | status | cancel")
     print("branchminer recover before|after  (only when action outcome is unknown)")
     print("Options: --gps --heading north|east|south|west --no-veins --no-pave")

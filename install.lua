@@ -39,7 +39,7 @@ end
 fs.delete(STAGE)
 if not update then print("Installed. Place OUTPUT CHEST behind the new start and FUEL CHEST below it.") end
 print("New branch job: branchminer new 30 20 3")
-print("New quarry job: branchminer quarry 5  (11x11 ahead of the base, down to bedrock)")
+print("New quarry job: branchminer quarry 10  (10x10 ahead of the base, down to bedrock)")
 print("GPS:   branchminer new 30 20 3 --gps --heading north")
 print("Continuous: pairs = 0; chunk-load the whole route and output/fuel chests.")
 print("Resume never changes the original start. See the repository README.")
