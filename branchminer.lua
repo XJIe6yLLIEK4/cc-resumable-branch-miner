@@ -2,7 +2,7 @@
 -- Copyright (c) 2026 XJIe6yLLIEK4. MIT License.
 -- No external Lua libraries. Each turtle owns its own /.branchminer directory.
 local arguments = { ... }
-local VERSION, SCHEMA = "1.3.0", 1
+local VERSION, SCHEMA = "1.4.0", 1
 local ROOT = "/.branchminer"
 local DIRECTIONS = {
     [0] = { x = 0, z = 1 }, [1] = { x = 1, z = 0 },
@@ -54,6 +54,19 @@ local function writeFile(path, data)
     if not ok then error("Cannot write checkpoint: " .. tostring(err), 0) end
 end
 local function remove(path) if fs.exists(path) then fs.delete(path) end end
+local function replaceFile(path, data)
+    writeFile(path .. ".tmp", data); remove(path); fs.move(path .. ".tmp", path)
+end
+local function fields(raw)
+    local result = {}
+    for value in (raw or ""):gmatch("[^\t\r\n]+") do result[#result + 1] = value end
+    return result
+end
+local function assisted()
+    -- Text handles may normalize the final newline (including readAll in CC).
+    local flag = readFile(ROOT .. "/server-assist")
+    return flag == "1" or flag == "1\n" or flag == "1\r\n"
+end
 local function decode(raw)
     if not raw then return nil end
     local ok, envelope = pcall(textutils.unserialize, raw)
@@ -161,6 +174,7 @@ function Miner.create(options)
         work = { pair = 1, phase = "main", step = 1, stage = "move" },
         stats = { moves = 0, blocks = 0, ores = 0, pairs = 0, serviceTrips = 0 },
     }
+    if assisted() then job.needsServerAnchor = true end
     if config.mode == "quarry" then
         job.work = { phase = "quarry", layer = 0, cell = 0, stage = "entry", blocked = {}, blockedCount = 0 }
         job.stats.layers = 0
@@ -175,6 +189,48 @@ function Miner:status(status, reason)
     return false, reason
 end
 function Miner:waiting(reason) return self:status("waiting", reason) end
+function Miner:heartbeat(force)
+    if not assisted() then return end
+    local now = os.epoch("utc")
+    if not force and self.lastHeartbeat and now - self.lastHeartbeat < 2000 then return end
+    local j, p = self.job, self.job.pose
+    replaceFile(ROOT .. "/assist.heartbeat", table.concat({ "1", tostring(j.computer), j.id,
+        tostring(j.seq), tostring(p.x), tostring(p.y), tostring(p.z), tostring(p.h), j.status,
+        tostring(now) }, "\t") .. "\n")
+    self.lastHeartbeat = now
+end
+function Miner:resolveAssisted(anchor)
+    -- The worker performs NO physical actions while the host observes its live
+    -- block. A fresh nonce binds the answer to this boot and exact journal.
+    self:waiting("Waiting for server position/direction verification; original job retained.")
+    local j = self.job
+    local p = anchor and { kind = "anchor", from = j.home, to = j.home } or j.pending
+    if not self.assistRequest or self.assistRequest.seq ~= j.seq then
+        self.assistRequest = { seq = j.seq, token = tostring(os.epoch("utc")) .. ":" .. tostring(j.seq) }
+        replaceFile(ROOT .. "/assist.request", table.concat({ "1", tostring(j.computer), j.id,
+            tostring(j.seq), self.assistRequest.token, p.kind,
+            tostring(p.from.x), tostring(p.from.y), tostring(p.from.z), tostring(p.from.h),
+            tostring(p.to.x), tostring(p.to.y), tostring(p.to.z), tostring(p.to.h) }, "\t") .. "\n")
+        self:heartbeat(true)
+    end
+    local reply = fields(readFile(ROOT .. "/assist.response"))
+    if #reply ~= 9 or reply[1] ~= "1" or tonumber(reply[2]) ~= j.computer
+        or reply[3] ~= j.id or tonumber(reply[4]) ~= j.seq or reply[5] ~= self.assistRequest.token then return false end
+    local actual = point(tonumber(reply[6]), tonumber(reply[7]), tonumber(reply[8]), tonumber(reply[9]))
+    local before = same(actual, p.from) and actual.h == p.from.h
+    local after = same(actual, p.to) and actual.h == p.to.h
+    if not before and not after then
+        return self:status("recovery", "Server position/direction differs from BOTH saved outcomes. Verify external relocation; original home retained.")
+    end
+    j.pose = copy(after and p.to or p.from)
+    if after and not anchor and p.kind ~= "turnLeft" and p.kind ~= "turnRight" then j.stats.moves = j.stats.moves + 1 end
+    if anchor then j.needsServerAnchor = nil end
+    j.pending, self.assistRequest = nil, nil
+    self:status("running"); self:save()
+    remove(ROOT .. "/assist.request"); remove(ROOT .. "/assist.response")
+    self:heartbeat(true)
+    return true
+end
 function Miner:control()
     local raw = readFile(ROOT .. "/control")
     if not raw then return end
@@ -378,6 +434,7 @@ end
 function Miner:resolve()
     local pending = self.job.pending; if not pending then return true end
     if pending.kind == "probe" then return self:resolveProbe() end
+    if assisted() then return self:resolveAssisted() end
     if pending.kind == "turnLeft" or pending.kind == "turnRight" then
         if not self.job.home.world then
             return self:status("recovery", "Turn outcome is unknown. Confirm with recover before or recover after; old home is preserved.")
@@ -734,6 +791,7 @@ end
 function Miner:tick()
     self:control()
     if self.job.status == "paused" or self.job.status == "cancelled" or self.job.status == "completed" then return false end
+    if self.job.needsServerAnchor then return self:resolveAssisted(true) end
     if self.job.pending then return self:resolve() end
     if self.job.status == "recovery" then return false end
     if self.job.service then return self:service() end
@@ -806,6 +864,7 @@ local function run(instance)
     local ok, why = pcall(function()
         instance:status("running")
         while true do
+            instance:heartbeat()
             local progress = instance:tick()
             local state = instance.job.status
             if state == "paused" or state == "cancelled" or state == "completed" or state == "recovery" then break end
@@ -822,6 +881,7 @@ local function run(instance)
         pcall(function() instance:save() end)
         print("Stopped: " .. tostring(why) .. ". Saved home and job retained; use resume.")
     else summary(instance.job) end
+    pcall(function() instance:heartbeat(true) end)
 end
 local function parse(args)
     local config, i

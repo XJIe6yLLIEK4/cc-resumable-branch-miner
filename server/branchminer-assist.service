@@ -1,0 +1,21 @@
+[Unit]
+Description=Live position recovery and moving chunk tickets for CC miners
+After=minecraft.service
+Requires=minecraft.service
+PartOf=minecraft.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/branchminer-assist/assist.py --config /etc/branchminer-assist.json
+Restart=on-failure
+RestartSec=3
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateNetwork=true
+ReadWritePaths=/srv/minecraft/Bembi_touwn/computercraft/computer /var/lib/branchminer-assist /run/minecraft
+
+[Install]
+WantedBy=minecraft.service

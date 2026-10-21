@@ -185,6 +185,88 @@ local passed=0
 local function test(name,fn)
     fn();passed=passed+1;print("PASS " .. name)
 end
+local function assistReply(f)
+    local raw=f.files["/.branchminer/assist.request"]
+    expect(raw,"No server observation request")
+    local parts={};for value in raw:gmatch("[^\t\r\n]+") do parts[#parts+1]=value end
+    local p=f.pose
+    f.files["/.branchminer/assist.response"]=table.concat({parts[1],parts[2],parts[3],parts[4],parts[5],
+        tostring(p.x),tostring(p.y),tostring(p.z),tostring(p.h)},"\t").."\n"
+end
+test("server-assisted recovery survives every action boundary in both modes without GPS",function()
+    for _,config in ipairs({{length=1,pairs=1,spacing=2,veins=false,pave=false},
+        {mode="quarry",side=2,veins=false}}) do
+        local baseline=fixture({minY=-1});local original=baseline.api.Miner.create(config)
+        finish(baseline,original)
+        for cut=1,baseline.actionCount do for _,when in ipairs({"cutBefore","cutAfter"}) do
+            local f=fixture({minY=-1});f.files["/.branchminer/server-assist"]="1\n"
+            local m=f.api.Miner.create(config);m.job.needsServerAnchor=nil;m:save();f[when]=cut
+            expect(not pcall(finish,f,m),"Expected physical interruption")
+            f[when]=nil;m=assert(f.api.Miner.load())
+            local home,work,vein=serial(m.job.home),serial(m.job.work),serial(m.job.vein)
+            expect(m.job.pending~=nil)
+            expect(not m:resolve());expect(m.job.status=="waiting")
+            assistReply(f);expect(m:resolve())
+            expect(eq(m.job.pose,f.pose) and m.job.pose.h==f.pose.h)
+            expect(home==serial(m.job.home) and work==serial(m.job.work) and vein==serial(m.job.vein))
+            finish(f,m)
+            expect(m.job.stats.moves==original.job.stats.moves,"Recovered translation counted twice")
+            expect(eq(f.pose,{x=0,y=0,z=0}) and f.pose.h==baseline.pose.h)
+        end end
+    end
+end)
+test("new assisted jobs wait for their own anchor before the first physical action",function()
+    local f=fixture();f.files["/.branchminer/server-assist"]="1\n"
+    local m=f.api.Miner.create({veins=false,pave=false})
+    expect(m.job.needsServerAnchor)
+    expect(not m:tick() and f.actionCount==0 and m.job.status=="waiting")
+    local oldHome=serial(m.job.home)
+    assistReply(f);expect(m:tick())
+    expect(not m.job.needsServerAnchor and not m.job.pending and f.actionCount==0)
+    expect(serial(m.job.home)==oldHome and m.job.stats.moves==0)
+end)
+test("server assistance flag accepts text handles with or without a final newline",function()
+    for _,flag in ipairs({"1","1\n","1\r\n"}) do
+        local f=fixture();f.files["/.branchminer/server-assist"]=flag
+        local m=f.api.Miner.create({veins=false,pave=false})
+        expect(m.job.needsServerAnchor,"Assistance flag was ignored")
+        m:heartbeat();expect(f.files["/.branchminer/assist.heartbeat"]~=nil)
+    end
+end)
+test("server replies from an older boot, job, sequence or computer cannot settle a turn",function()
+    for field=2,5 do
+        local f=fixture();f.files["/.branchminer/server-assist"]="1\n"
+        local m=f.api.Miner.create({veins=false,pave=false});f.cutAfter=1
+        expect(not pcall(m.face,m,1));f.cutAfter=nil
+        m=assert(f.api.Miner.load());m:resolve();assistReply(f)
+        local parts={};for v in f.files["/.branchminer/assist.response"]:gmatch("[^\t\r\n]+") do parts[#parts+1]=v end
+        parts[field]=field==2 and "999" or "stale"
+        f.files["/.branchminer/assist.response"]=table.concat(parts,"\t").."\n"
+        expect(not m:resolve() and m.job.pending~=nil and m.job.status=="waiting")
+        local count=f.actionCount;m=assert(f.api.Miner.load());m:resolve()
+        expect(f.actionCount==count,"Observation made a physical move")
+        assistReply(f);expect(m:resolve())
+    end
+end)
+test("server observation fails closed for an externally changed pose",function()
+    local f=fixture();f.files["/.branchminer/server-assist"]="1\n"
+    local m=f.api.Miner.create({veins=false,pave=false});f.cutAfter=1
+    expect(not pcall(m.face,m,1));f.cutAfter=nil
+    m=assert(f.api.Miner.load());m:resolve();f.pose.h=2;assistReply(f)
+    expect(not m:resolve() and m.job.status=="recovery" and m.job.pending~=nil)
+    expect(eq(m.job.home,{x=0,y=0,z=0}) and m.job.home.h==0)
+end)
+test("server heartbeat is throttled and explicit pause survives computer boot",function()
+    local f=fixture();f.files["/.branchminer/server-assist"]="1\n"
+    local m=f.api.Miner.create({veins=false,pave=false});m:heartbeat()
+    local raw=f.files["/.branchminer/assist.heartbeat"]
+    m.job.pose.x=1;m:heartbeat();expect(f.files["/.branchminer/assist.heartbeat"]==raw)
+    m:heartbeat(true);expect(f.files["/.branchminer/assist.heartbeat"]~=raw)
+    m.job.pose.x=0;m:status("paused","Paused by user.")
+    local count=f.actionCount
+    assert(load(PROGRAM_SOURCE,"branchminer","t",f.env))("boot")
+    expect(f.actionCount==count and f.api.Miner.load().job.status=="paused")
+end)
 test("main tunnel and two-high left/right branches; finish at original home",function()
     local f=fixture();local m=f.api.Miner.create({length=3,pairs=2,spacing=3,veins=false,pave=false})
     for z=1,6 do f.blocks["0,0,"..z]="minecraft:stone";f.blocks["0,1,"..z]="minecraft:stone" end
